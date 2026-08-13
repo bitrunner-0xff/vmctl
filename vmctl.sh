@@ -235,28 +235,64 @@ get_vm_mac() {
 }
 
 get_vm_ip_once() {
-    local vm=$1 ip='' mac=''
+    local vm=$1
+    local ip=''
+    local mac=''
 
     vm_exists "$vm" || return 1
     vm_is_running "$vm" || return 1
 
-    # Best source when qemu-guest-agent is available.
-    ip=$(run_virsh domifaddr "$vm" --source agent 2>/dev/null |
-        awk 'NR > 2 && $4 ~ /^[0-9]+\./ { sub(/\/.*/, "", $4); print $4; exit }')
+    mac=$(get_vm_mac "$vm")
+    [[ -n $mac ]] || return 1
 
-    # Libvirt/DHCP lease source.
+    # Best source: qemu-guest-agent.
+    # Match the VM NIC by MAC so we don't accidentally return lo/127.0.0.1.
+    ip=$(
+        run_virsh domifaddr "$vm" --source agent 2>/dev/null |
+            awk -v mac="$mac" '
+                NR > 2 &&
+                tolower($2) == tolower(mac) &&
+                $3 == "ipv4" {
+                    split($4, addr, "/")
+                    if (addr[1] !~ /^127\./) {
+                        print addr[1]
+                        exit
+                    }
+                }
+            '
+    )
+
+    # Libvirt DHCP lease fallback.
     if [[ -z $ip ]]; then
-        ip=$(run_virsh domifaddr "$vm" --source lease 2>/dev/null |
-            awk 'NR > 2 && $4 ~ /^[0-9]+\./ { sub(/\/.*/, "", $4); print $4; exit }')
+        ip=$(
+            run_virsh domifaddr "$vm" --source lease 2>/dev/null |
+                awk -v mac="$mac" '
+                    NR > 2 &&
+                    tolower($2) == tolower(mac) &&
+                    $3 == "ipv4" {
+                        split($4, addr, "/")
+                        if (addr[1] !~ /^127\./) {
+                            print addr[1]
+                            exit
+                        }
+                    }
+                '
+        )
     fi
 
-    # Host neighbor table fallback.
+    # Host neighbor-table fallback.
     if [[ -z $ip ]]; then
-        mac=$(get_vm_mac "$vm")
-        if [[ -n $mac ]]; then
-            ip=$(ip neigh show 2>/dev/null |
-                awk -v mac="$mac" 'tolower($0) ~ mac && $1 ~ /^[0-9]+\./ { print $1; exit }')
-        fi
+        ip=$(
+            ip neigh show 2>/dev/null |
+                awk -v mac="$mac" '
+                    tolower($0) ~ tolower(mac) &&
+                    $1 ~ /^[0-9]+\./ &&
+                    $1 !~ /^127\./ {
+                        print $1
+                        exit
+                    }
+                '
+        )
     fi
 
     [[ -n $ip ]] || return 1
@@ -267,7 +303,7 @@ get_vm_ip_cli() {
     local wait_seconds=0 interval=$DEFAULT_WAIT_INTERVAL
     local OPTIND=1 opt
 
-    while getopts ':hw:i:' opt; do
+    while getopts ':h:w:i:' opt; do
         case "$opt" in
         h)
             get_ip_usage
